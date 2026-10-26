@@ -93,23 +93,55 @@ static long long primary(void) {
     return parse_number();
 }
 
-// term := primary { ('*' | '/') primary }
+// Integer power by repeated squaring: O(log e) multiplications, so even
+// 1 ** 1000000000 is instant. x ** 0 is 1 for every x, including 0 ** 0 (rule 8).
+static long long ipow(long long base, long long e) {
+    long long r = 1;
+    while (e > 0) {
+        if (e & 1) r *= base;
+        e >>= 1;
+        if (e) base *= base;                 // skip the last squaring: it is never used and could overflow
+    }
+    return r;
+}
+
+// power := primary [ '**' power ]
+// power() calls ITSELF for the exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2):
+// the right-hand side swallows the rest of the chain first. That is what makes
+// ** right-associative; a loop (as in expr/term) would group it from the left.
+static long long power(void) {
+    long long base = primary();
+    if (err_pos) return base;
+    skip_ws();
+    if (p[0] == '*' && p[1] == '*') {        // '**' is one token; a lone '*' belongs to term()
+        p += 2;
+        skip_ws();
+        const char *exp_at = p;              // a negative exponent is reported at the START of the exponent
+        long long e = power();
+        if (err_pos) return base;            // a syntax error inside the exponent wins
+        if (e < 0) { fail_at(exp_at); return 0; }
+        return ipow(base, e);
+    }
+    return base;
+}
+
+// term := power { ('*' | '/') power }
 // expr below calls term() for its operands, so term binds tighter: in 3 + 2 * 5
 // the 2 * 5 is finished inside term() before expr ever sees the '+'. That call
 // structure IS the precedence; no table of priorities is needed.
 static long long term(void) {
-    long long v = primary();
+    long long v = power();
     for (;;) {
         if (err_pos) return v;
         skip_ws();
         if (*p == '*') {
             p++;
-            v *= primary();
+            v *=power();
         } else if (*p == '/') {
             p++;
             skip_ws();
             const char *rhs = p;             // division by zero is reported at the START of the right operand
-            long long d = primary();
+            long long d = power();
             if (err_pos) return v;           // a syntax error came first, so it wins
             if (d == 0) { fail_at(rhs); return 0; }
             v /= d;                          // C truncates toward zero, exactly what rule 8 asks for
@@ -167,6 +199,9 @@ static int process_file(const char *input, const char *outdir) {
         skip_ws();
         if (*p == '\n') { p++; continue; }   // blank line: no output
         if (!*p) break;
+        // '#' is a comment only as the FIRST non-blank character of a line. We just
+        // skip it like any other text; positions stay right because p never resets.
+        if (*p == '#') { while (*p && *p != '\n') p++; continue; }
         long long v = expr();
         skip_ws();
         // The expression ended but the line did not: whatever is left (e.g. '&')
