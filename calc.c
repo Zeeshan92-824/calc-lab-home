@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <ctype.h>
+#include <math.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -59,35 +60,74 @@ static void skip_ws(void) {                 // spaces/tabs may sit between any t
     while (*p == ' ' || *p == '\t') p++;
 }
 
+// ---- Values: integer or float ----------------------------------------------
+// Every value remembers which kind it is. The rule (rule 9) is: an operation is
+// done in double if EITHER operand is a float, otherwise in long long. Carrying
+// the kind along with the number lets each operator make that decision locally,
+// at the moment it has both operands, instead of guessing from the text.
+typedef struct { int is_float; long long i; double d; } Val;
+
+static Val mk_int(long long i) { Val v = { 0, i, 0.0 }; return v; }
+static Val mk_flt(double d)    { Val v = { 1, 0, d };   return v; }
+static double as_dbl(Val v)    { return v.is_float ? v.d : (double)v.i; }
+
+// A float result that is infinite or NaN is an error reported at the OPERATOR
+// (rule 5), so the caller passes the operator's position, not the operands'.
+static Val check_float(double d, const char *op) {
+    if (!isfinite(d)) { fail_at(op); return mk_int(0); }
+    return mk_flt(d);
+}
+
 // An operand MUST start with a digit. Anything else here is exactly one of the
 // error cases: invalid character, a second operator in a row, or a missing operand
 // at '\n' / end of file. All three are reported at p, the token we were looking
 // at, so a single check covers them. At the last line without '\n', p sits on the
 // '\0' sentinel = file length + 1, which is what the rules ask for.
-static long long parse_number(void) {       // digits only for now (floats: Step 8)
+// Floats are digits '.' digits. ".5" fails the digit check above (error at the
+// '.'); "5." fails the check below (error at the '.'); "1.5e3" parses as 1.5 and
+// the leftover 'e' is reported by process_file, which is the required position.
+static Val parse_number(void) {
     skip_ws();
-    if (!isdigit((unsigned char)*p)) { fail_at(p); return 0; }
-    long long v = 0;
-    while (isdigit((unsigned char)*p)) v = v * 10 + (*p++ - '0');
-    return v;
+    if (!isdigit((unsigned char)*p)) { fail_at(p); return mk_int(0); }
+    const char *s = p;
+    while (isdigit((unsigned char)*p)) p++;
+    if (*p != '.') {                          // plain integer
+        long long v = 0;
+        for (const char *c = s; c < p; c++) v = v * 10 + (*c - '0');
+        return mk_int(v);
+    }
+    if (!isdigit((unsigned char)p[1])) { fail_at(p); return mk_int(0); }
+    p++;
+    while (isdigit((unsigned char)*p)) p++;
+    // strtod would also swallow an exponent ("1.5e3") that we must reject, so we
+    // hand it a private copy of exactly the digits '.' digits we validated.
+    size_t n = (size_t)(p - s);
+    char small[64];
+    char *buf = n < sizeof small ? small : malloc(n + 1);
+    if (!buf) { fprintf(stderr, "calc: out of memory\n"); exit(1); }
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    double d = strtod(buf, NULL);
+    if (buf != small) free(buf);
+    return mk_flt(d);
 }
 
-static long long expr(void);                // forward declaration: primary() and expr() call each other
+static Val expr(void);                      // forward declaration: primary() and expr() call each other
 
 // primary := NUMBER | '(' expr ')'
 // A '(' restarts the whole grammar at the lowest level (expr), which is why
 // (2 + 3) * 4 works: the parenthesised sum is finished before term() multiplies.
-static long long primary(void) {
+static Val primary(void) {
     skip_ws();
     if (*p == '(') {
         p++;
-        long long v = expr();
+        Val v = expr();
         if (err_pos) return v;               // an error inside the parentheses wins
         skip_ws();
         // Missing ')' is reported where the line ends ('\n', or the '\0' sentinel
         // = file length + 1): that is the token we were looking at when we could
         // not continue. An EXTRA ')' is caught later in process_file, at that ')'.
-        if (*p != ')') { fail_at(p); return 0; }
+        if (*p != ')') { fail_at(p); return mk_int(0); }
         p++;
         return v;
     }
@@ -110,18 +150,22 @@ static long long ipow(long long base, long long e) {
 // power() calls ITSELF for the exponent, so 2 ** 3 ** 2 groups as 2 ** (3 ** 2):
 // the right-hand side swallows the rest of the chain first. That is what makes
 // ** right-associative; a loop (as in expr/term) would group it from the left.
-static long long power(void) {
-    long long base = primary();
+static Val power(void) {
+    Val base = primary();
     if (err_pos) return base;
     skip_ws();
     if (p[0] == '*' && p[1] == '*') {        // '**' is one token; a lone '*' belongs to term()
+        const char *op = p;                  // float overflow / NaN is reported at the operator
         p += 2;
         skip_ws();
-        const char *exp_at = p;              // a negative exponent is reported at the START of the exponent
-        long long e = power();
+        const char *exp_at = p;              // a negative integer exponent is reported at the START of the exponent
+        Val e = power();
         if (err_pos) return base;            // a syntax error inside the exponent wins
-        if (e < 0) { fail_at(exp_at); return 0; }
-        return ipow(base, e);
+        if (!base.is_float && !e.is_float) { // int ** int stays an integer; negative exponent has no integer result
+            if (e.i < 0) { fail_at(exp_at); return mk_int(0); }
+            return mk_int(ipow(base.i, e.i));
+        }
+        return check_float(pow(as_dbl(base), as_dbl(e)), op);
     }
     return base;
 }
@@ -130,22 +174,29 @@ static long long power(void) {
 // expr below calls term() for its operands, so term binds tighter: in 3 + 2 * 5
 // the 2 * 5 is finished inside term() before expr ever sees the '+'. That call
 // structure IS the precedence; no table of priorities is needed.
-static long long term(void) {
-    long long v = power();
+static Val term(void) {
+    Val v = power();
     for (;;) {
         if (err_pos) return v;
         skip_ws();
         if (*p == '*') {
+            const char *op = p;
             p++;
-            v *=power();
+            Val r = power();
+            if (err_pos) return v;
+            if (v.is_float || r.is_float) v = check_float(as_dbl(v) * as_dbl(r), op);
+            else                          v = mk_int(v.i * r.i);
         } else if (*p == '/') {
+            const char *op = p;
             p++;
             skip_ws();
             const char *rhs = p;             // division by zero is reported at the START of the right operand
-            long long d = power();
+            Val r = power();
             if (err_pos) return v;           // a syntax error came first, so it wins
-            if (d == 0) { fail_at(rhs); return 0; }
-            v /= d;                          // C truncates toward zero, exactly what rule 8 asks for
+            int zero = r.is_float ? (r.d == 0.0) : (r.i == 0);   // float 0.0 is a zero-division too (rule 9)
+            if (zero) { fail_at(rhs); return v; }
+            if (v.is_float || r.is_float) v = check_float(as_dbl(v) / as_dbl(r), op);
+            else                          v = mk_int(v.i / r.i);  // C truncates toward zero, exactly what rule 8 asks for
         } else break;
     }
     return v;
@@ -153,18 +204,27 @@ static long long term(void) {
 
 // expr := term { ('+' | '-') term }
 // The loop (not recursion) makes + and - LEFT-associative: 8 - 3 - 2 = (8-3)-2.
-static long long expr(void) {
-    long long v = term();
+static Val expr(void) {
+    Val v = term();
     for (;;) {
         if (err_pos) return v;               // stop at the first error
         skip_ws();
-        if (*p == '+')      { p++; v += term(); }
-        else if (*p == '-') { p++; v -= term(); }
-        else break;
+        if (*p == '+' || *p == '-') {
+            const char *op = p;
+            int plus = (*p == '+');
+            p++;
+            Val r = term();
+            if (err_pos) return v;
+            if (v.is_float || r.is_float) {
+                double a = as_dbl(v), b = as_dbl(r);
+                v = check_float(plus ? a + b : a - b, op);
+            } else {
+                v = mk_int(plus ? v.i + r.i : v.i - r.i);
+            }
+        } else break;
     }
     return v;
 }
-
 // ---- Files and folders --------------------------------------------------------
 // "dir/task1.txt" -> "task1" (file name without folder and without .txt)
 static void base_name(const char *path, char *out, size_t cap) {
@@ -203,13 +263,14 @@ static int process_file(const char *input, const char *outdir) {
         // '#' is a comment only as the FIRST non-blank character of a line. We just
         // skip it like any other text; positions stay right because p never resets.
         if (*p == '#') { while (*p && *p != '\n') p++; continue; }
-        long long v = expr();
+        Val v = expr(); 
         skip_ws();
         // The expression ended but the line did not: whatever is left (e.g. '&')
         // is the token we could not continue with, so it is the error position.
         if (*p != '\n' && *p != '\0') fail_at(p);
         if (err_pos) break;
-        fprintf(out, "%lld\n", v);
+        if (v.is_float) fprintf(out, "%.15g\n", v.d);   // rule 10: floats with %.15g
+        else            fprintf(out, "%lld\n", v.i);    // integers with %lld
         while (*p && *p != '\n') p++;        // move to the end of this line
     }
     if (err_pos) {
