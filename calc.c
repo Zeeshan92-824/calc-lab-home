@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,20 +225,79 @@ static int process_file(const char *input, const char *outdir) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    const char *outdir = NULL, *input = NULL;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
-        else input = argv[i];
-    }
-    if (!input) { fprintf(stderr, "usage: calc [-o OUTDIR] input.txt\n"); return 1; }
+// "labs/", "a/labs" or "labs" -> "labs": the folder's own name, used for the
+// default output folder name when -d is given.
+static void dir_base(const char *path, char *out, size_t cap) {
+    size_t n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') n--;         // ignore trailing slashes
+    size_t i = n;
+    while (i > 0 && path[i - 1] != '/') i--;         // walk back to the last '/'
+    size_t len = n - i;
+    if (len >= cap) len = cap - 1;
+    memcpy(out, path + i, len);
+    out[len] = '\0';
+}
 
-    char dflt[4096];                         // default folder: <base>_<name>_<id>
+// Evaluates every *.txt file directly inside dir. Subfolders and other file
+// types are skipped (stat + S_ISREG also skips a *folder* that happens to be
+// named something.txt). One bad file does not stop the others.
+static int process_dir(const char *dir, const char *outdir) {
+    DIR *d = opendir(dir);
+    if (!d) { fprintf(stderr, "calc: cannot open folder %s\n", dir); return 1; }
+    int rc = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n <= 4 || strcmp(e->d_name + n - 4, ".txt") != 0) continue;
+        char path[8192];
+        if (snprintf(path, sizeof path, "%s/%s", dir, e->d_name) >= (int)sizeof path) {
+            fprintf(stderr, "calc: path too long: %s\n", e->d_name);
+            rc = 1;
+            continue;
+        }
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (process_file(path, outdir) != 0) rc = 1;
+    }
+    closedir(d);
+    return rc;
+}
+
+static int usage(const char *why) {
+    if (why) fprintf(stderr, "calc: %s\n", why);
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+    return 1;                                        // any usage problem = non-zero exit (section 4)
+}
+
+int main(int argc, char **argv) {
+    const char *outdir = NULL, *input = NULL, *dir = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-o") || !strcmp(a, "--output-dir")) {
+            if (i + 1 >= argc) return usage("missing value after -o / --output-dir");
+            outdir = argv[++i];
+        } else if (!strcmp(a, "-d") || !strcmp(a, "--dir")) {
+            if (i + 1 >= argc) return usage("missing value after -d / --dir");
+            dir = argv[++i];
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "calc: unknown option %s\n", a);
+            return usage(NULL);
+        } else if (input) {
+            return usage("only one input file is allowed");
+        } else {
+            input = a;
+        }
+    }
+    if (!dir && !input) return usage("no input file or folder given");
+    if (dir && input)   return usage("use either an input file or -d, not both");
+
+    char dflt[4096];                         // default folder: <input_base>_<name>_<id>
     if (!outdir) {
         char base[256];
-        base_name(input, base, sizeof base);
+        if (dir) dir_base(dir, base, sizeof base);
+        else     base_name(input, base, sizeof base);
         snprintf(dflt, sizeof dflt, "%s_%s_%s", base, NAME, ID);
         outdir = dflt;
     }
-    return process_file(input, outdir);
+    return dir ? process_dir(dir, outdir) : process_file(input, outdir);
 }
