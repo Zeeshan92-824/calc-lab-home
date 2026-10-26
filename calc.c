@@ -71,23 +71,45 @@ static long long parse_number(void) {       // digits only for now (floats: Step
     return v;
 }
 
-// term := number { ('*' | '/') number }
+static long long expr(void);                // forward declaration: primary() and expr() call each other
+
+// primary := NUMBER | '(' expr ')'
+// A '(' restarts the whole grammar at the lowest level (expr), which is why
+// (2 + 3) * 4 works: the parenthesised sum is finished before term() multiplies.
+static long long primary(void) {
+    skip_ws();
+    if (*p == '(') {
+        p++;
+        long long v = expr();
+        if (err_pos) return v;               // an error inside the parentheses wins
+        skip_ws();
+        // Missing ')' is reported where the line ends ('\n', or the '\0' sentinel
+        // = file length + 1): that is the token we were looking at when we could
+        // not continue. An EXTRA ')' is caught later in process_file, at that ')'.
+        if (*p != ')') { fail_at(p); return 0; }
+        p++;
+        return v;
+    }
+    return parse_number();
+}
+
+// term := primary { ('*' | '/') primary }
 // expr below calls term() for its operands, so term binds tighter: in 3 + 2 * 5
 // the 2 * 5 is finished inside term() before expr ever sees the '+'. That call
 // structure IS the precedence; no table of priorities is needed.
 static long long term(void) {
-    long long v = parse_number();
+    long long v = primary();
     for (;;) {
         if (err_pos) return v;
         skip_ws();
         if (*p == '*') {
             p++;
-            v *= parse_number();
+            v *= primary();
         } else if (*p == '/') {
             p++;
             skip_ws();
             const char *rhs = p;             // division by zero is reported at the START of the right operand
-            long long d = parse_number();
+            long long d = primary();
             if (err_pos) return v;           // a syntax error came first, so it wins
             if (d == 0) { fail_at(rhs); return 0; }
             v /= d;                          // C truncates toward zero, exactly what rule 8 asks for
