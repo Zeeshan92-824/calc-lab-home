@@ -46,13 +46,26 @@ static char *read_file(const char *path, size_t *len) {
 // counted automatically, with no separate counter that could drift out of sync.
 static const char *start;   // first byte of the file
 static const char *p;       // the character we are looking at right now
+static size_t err_pos = 0;  // 0 = no error so far; otherwise the 1-based error position
+
+// Only the FIRST error counts (rule 3), so later calls are ignored. The caller
+// passes the token the parser was looking at when it could not continue (rule 5).
+static void fail_at(const char *where) {
+    if (!err_pos) err_pos = (size_t)(where - start) + 1;
+}
 
 static void skip_ws(void) {                 // spaces/tabs may sit between any tokens
     while (*p == ' ' || *p == '\t') p++;
 }
 
+// An operand MUST start with a digit. Anything else here is exactly one of the
+// error cases: invalid character, a second operator in a row, or a missing operand
+// at '\n' / end of file. All three are reported at p, the token we were looking
+// at, so a single check covers them. At the last line without '\n', p sits on the
+// '\0' sentinel = file length + 1, which is what the rules ask for.
 static long long parse_number(void) {       // digits only for now (floats: Step 8)
     skip_ws();
+    if (!isdigit((unsigned char)*p)) { fail_at(p); return 0; }
     long long v = 0;
     while (isdigit((unsigned char)*p)) v = v * 10 + (*p++ - '0');
     return v;
@@ -63,6 +76,7 @@ static long long parse_number(void) {       // digits only for now (floats: Step
 static long long expr(void) {
     long long v = parse_number();
     for (;;) {
+        if (err_pos) return v;   
         skip_ws();
         if (*p == '+')      { p++; v += parse_number(); }
         else if (*p == '-') { p++; v -= parse_number(); }
@@ -100,13 +114,28 @@ static int process_file(const char *input, const char *outdir) {
     FILE *out = fopen(outpath, "w");
     if (!out) { fprintf(stderr, "calc: cannot write %s\n", outpath); free(text); return 1; }
 
-    start = p = text;
+       start = p = text;
+    err_pos = 0;
     while (*p) {
         skip_ws();
         if (*p == '\n') { p++; continue; }   // blank line: no output
         if (!*p) break;
-        fprintf(out, "%lld\n", expr());
+        long long v = expr();
+        skip_ws();
+        // The expression ended but the line did not: whatever is left (e.g. '&')
+        // is the token we could not continue with, so it is the error position.
+        if (*p != '\n' && *p != '\0') fail_at(p);
+        if (err_pos) break;
+        fprintf(out, "%lld\n", v);
         while (*p && *p != '\n') p++;        // move to the end of this line
+    }
+    if (err_pos) {
+        // Rule 3: on any error the file holds ONLY the error line, so throw away
+        // the results already written by reopening the file in "w" mode.
+        FILE *again = freopen(outpath, "w", out);
+        if (!again) { fprintf(stderr, "calc: cannot write %s\n", outpath); free(text); return 1; }
+        out = again;
+        fprintf(out, "ERROR:%zu\n", err_pos);
     }
     fclose(out);
     free(text);
