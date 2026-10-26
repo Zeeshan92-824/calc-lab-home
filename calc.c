@@ -71,15 +71,40 @@ static long long parse_number(void) {       // digits only for now (floats: Step
     return v;
 }
 
-// expr := number { ('+' | '-') number }
-// The loop (not recursion) makes + and - LEFT-associative: 8 - 3 - 2 = (8-3)-2.
-static long long expr(void) {
+// term := number { ('*' | '/') number }
+// expr below calls term() for its operands, so term binds tighter: in 3 + 2 * 5
+// the 2 * 5 is finished inside term() before expr ever sees the '+'. That call
+// structure IS the precedence; no table of priorities is needed.
+static long long term(void) {
     long long v = parse_number();
     for (;;) {
-        if (err_pos) return v;   
+        if (err_pos) return v;
         skip_ws();
-        if (*p == '+')      { p++; v += parse_number(); }
-        else if (*p == '-') { p++; v -= parse_number(); }
+        if (*p == '*') {
+            p++;
+            v *= parse_number();
+        } else if (*p == '/') {
+            p++;
+            skip_ws();
+            const char *rhs = p;             // division by zero is reported at the START of the right operand
+            long long d = parse_number();
+            if (err_pos) return v;           // a syntax error came first, so it wins
+            if (d == 0) { fail_at(rhs); return 0; }
+            v /= d;                          // C truncates toward zero, exactly what rule 8 asks for
+        } else break;
+    }
+    return v;
+}
+
+// expr := term { ('+' | '-') term }
+// The loop (not recursion) makes + and - LEFT-associative: 8 - 3 - 2 = (8-3)-2.
+static long long expr(void) {
+    long long v = term();
+    for (;;) {
+        if (err_pos) return v;               // stop at the first error
+        skip_ws();
+        if (*p == '+')      { p++; v += term(); }
+        else if (*p == '-') { p++; v -= term(); }
         else break;
     }
     return v;
